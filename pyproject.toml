@@ -1,0 +1,19 @@
+[build-system]
+requires = ["setuptools>=68", "wheel"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "c-cli"
+version = "0.1.0"
+description = "Personal CLI (c) — growing toolbox, AWS first"
+requires-python = ">=3.9"
+dependencies = [
+    "click>=8.1",
+]
+
+[project.scripts]
+c = "c.cli:main"
+
+[tool.setuptools.packages.find]
+where = ["."]
+include = ["c*"]
