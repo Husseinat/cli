@@ -2,6 +2,7 @@ import click
 
 from c.aws.cert import cert
 from c.aws.check import check
+from c.aws.logs import logs
 from c.aws.static_site import static_site
 from c.aws.zone import zone
 
@@ -31,3 +32,4 @@ aws.add_command(check)
 aws.add_command(cert)
 aws.add_command(zone)
 aws.add_command(static_site)
+aws.add_command(logs)

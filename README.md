@@ -66,6 +66,27 @@ c aws --profile work static-site example.com
 
 Re-running is idempotent: existing resources are detected and left alone.
 
+### `c aws logs …`
+
+Cross-function CloudWatch Logs for serverless apps. Each Lambda writes to its
+own log group (`/aws/lambda/<fn>`); these commands treat a glob over log-group
+names as the app/env selector and fan out across every match.
+
+`PATTERN` is a shell glob (`*`, `?`, `[…]`). Without a leading `/` the default
+prefix `/aws/lambda/` is prepended — so `myapp-prod-*` matches every Lambda
+whose name starts with `myapp-prod-`. Provide a full path to target other
+services (e.g. `/aws/apigateway/myapp-prod*`).
+
+```sh
+c aws logs list   myapp-prod-*                     # discover matching groups
+c aws logs tail   myapp-prod-* -f ERROR            # live tail (≤ 10 groups)
+c aws logs search myapp-prod-* -s 2h -f timeout    # history (≤ 50 groups)
+c aws logs search myapp-prod-* -q 'stats count() by bin(5m)'
+```
+
+Under the hood: `describe-log-groups` for discovery, `start-live-tail` for
+`tail`, `start-query` (CloudWatch Logs Insights) for `search`.
+
 ## Layout
 
 ```
@@ -77,6 +98,7 @@ c/
         ├── cli.py        # `c aws`
         ├── runner.py     # subprocess wrapper around the aws cli
         ├── check.py      # `c aws check`
+        ├── logs.py       # `c aws logs {list,tail,search}` — glob over log groups, fan-out
         └── static_site.py# `c aws static-site` (imperative aws cli calls, check-then-create)
 ```
 
