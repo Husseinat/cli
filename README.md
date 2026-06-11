@@ -137,6 +137,49 @@ Generate Production keys at https://developer.godaddy.com/keys.
 Points a GoDaddy-registered domain's nameservers at its Route53 hosted zone
 (or an explicit list via `-n`). No-op when they already match.
 
+## Claude
+
+### `c schedule-prompt WHEN PROMPT`
+
+Blocks until WHEN, then opens Claude Code in a directory with PROMPT. Useful
+for kicking off a long run overnight or after a rate-limit window resets.
+
+```sh
+c schedule-prompt 5h "Refactor the game loop" -C ~/dev/farming-game
+c schedule-prompt 03:00 "Nightly deep-research pass" --model fable --ultracode
+c schedule-prompt 2h30m "Fix the flaky tests" -p --permission-mode acceptEdits > run.log
+c schedule-prompt 1h "fix CI" -- --allowed-tools "Bash,Edit,Read"   # extra claude flags after --
+c schedule-prompt 4h "Ship the refactor" --model fable --ultracode --permission-mode auto  # autopilot
+```
+
+`WHEN` is a duration (`30s`, `5m`, `2h`, `1d`, compounds like `2h30m`), a
+wall-clock time (`03:00` — today, or tomorrow if already past), an ISO 8601
+timestamp, or `now`. Ctrl-C cancels the wait. When the time arrives the
+process replaces itself with `claude` running in `--path` (default: the
+current directory) — interactive by default, headless with `-p/--headless`.
+
+Options pass straight through to Claude Code:
+
+- `--model/-m` — alias (`fable`, `opus`, `sonnet`, `haiku`) or full name.
+- `--effort/-e` — `low | medium | high | xhigh | max` (→ `claude --effort`).
+- `--ultracode` — **not** an effort level; it's a per-session Claude Code
+  setting (sends xhigh and orchestrates dynamic workflows), forwarded as
+  `--settings '{"ultracode": true}'`. `--effort ultracode` is accepted as
+  shorthand. Mutually exclusive with `--effort`.
+- `--permission-mode` — for autopilot use `auto` (Claude Code's classifier
+  approves/denies each tool call on its own — the right choice for scheduled
+  runs nobody is watching). `acceptEdits` auto-approves file edits only;
+  Bash/web still prompt, which stalls an unattended run unless you also pass
+  `-- --allowed-tools …`. Think twice before `bypassPermissions` on a
+  "change anything" prompt.
+- `--dry-run` — print the schedule + final command and exit.
+
+The wait recomputes remaining time from the wall clock every tick, so a laptop
+that suspends mid-wait fires as soon as it wakes. On **macOS** the wait holds a
+`caffeinate -i` assertion so the machine doesn't idle-sleep past the scheduled
+time (the display may still sleep). On **Linux**, keep the machine awake
+yourself if needed, e.g. `systemd-inhibit --what=sleep c schedule-prompt …`.
+
 ## MCP
 
 `c` ships [Model Context Protocol](https://modelcontextprotocol.io) servers so
@@ -185,6 +228,8 @@ c/
     │   ├── cert.py       # `c aws cert issue` + ensure_certificate() core
     │   ├── logs.py       # `c aws logs {list,tail,search}` + search_log_groups() core
     │   └── static_site.py# `c aws static-site` (imperative aws cli calls, check-then-create)
+    ├── claude/
+    │   └── schedule_prompt.py # `c schedule-prompt` (block until a time, then exec claude)
     ├── godaddy/
     │   ├── cli.py        # `c godaddy`
     │   ├── api.py        # stdlib GoDaddy API client (sso-key auth)
