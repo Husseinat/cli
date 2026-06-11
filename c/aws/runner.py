@@ -8,6 +8,7 @@ from __future__ import annotations
 import json
 import shutil
 import subprocess
+import sys
 from typing import Any, Sequence
 
 
@@ -31,10 +32,11 @@ class AwsError(RuntimeError):
 def _aws_path() -> str:
     path = shutil.which("aws")
     if not path:
-        raise AwsCliMissing(
-            "The `aws` cli was not found on PATH. Install it: "
-            "https://docs.aws.amazon.com/cli/latest/userguide/getting-started-install.html"
+        hint = (
+            "`brew install awscli`" if sys.platform == "darwin"
+            else "https://docs.aws.amazon.com/cli/latest/userguide/getting-started-install.html"
         )
+        raise AwsCliMissing(f"The `aws` cli was not found on PATH. Install it: {hint}")
     return path
 
 

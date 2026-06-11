@@ -2,23 +2,42 @@
 
 Personal CLI toolbox. Starts with an AWS subcommand group; more to come.
 
+Works on Linux and macOS. Requires Python ≥ 3.10 and the `aws` cli on PATH.
+
 ## Install
+
+The most reliable way on both platforms is [pipx](https://pipx.pypa.io)
+(isolated venv, `c` on PATH, editable install keeps tracking this checkout):
+
+```sh
+pipx install -e .        # Linux: pip install --user pipx · macOS: brew install pipx
+pipx ensurepath          # once, then restart the shell
+```
+
+### Linux (alternative: pip --user)
 
 ```sh
 pip3 install --user -e .
-```
-
-Make sure `~/.local/bin` is on your `$PATH`:
-
-```sh
 echo 'export PATH="$HOME/.local/bin:$PATH"' >> ~/.zshrc && source ~/.zshrc
 ```
+
+### macOS notes
+
+- Homebrew's Python is [externally managed](https://peps.python.org/pep-0668/),
+  so plain `pip3 install --user` is rejected — use pipx above (or a venv).
+  The Xcode Command Line Tools' `pip3 install --user` works but drops the `c`
+  script into `~/Library/Python/3.x/bin`, which is rarely on `$PATH`.
+- AWS cli: `brew install awscli`. Python ≥ 3.10: `brew install python` if the
+  system one is older.
+- `c setup` writes Claude Desktop config to its macOS location
+  (`~/Library/Application Support/Claude/`) automatically.
 
 Verify:
 
 ```sh
 c --help
 c aws --help
+c aws check     # confirms aws cli + credentials
 ```
 
 ## AWS
@@ -37,34 +56,44 @@ c aws --profile work check
 
 ### `c aws static-site DOMAIN`
 
-Provisions a static website behind two CloudFront distributions. Every
-resource is created with a direct `aws` cli call; each step first checks
-whether the target resource already exists and skips if so — re-running the
-command resumes from wherever it left off.
+Provisions a static website end to end — DNS, registrar delegation,
+certificate, buckets, CloudFront — in one command. Every resource is created
+with a direct `aws` cli call; each step first checks whether the target
+resource already exists and skips if so — re-running the command resumes from
+wherever it left off.
 
 Resources, in order:
 
-1. `s3://DOMAIN` — private, `BucketOwnerEnforced`, full public-access block.
-2. `s3://www.DOMAIN` — S3 website redirect to `https://DOMAIN`.
-3. CloudFront Origin Access Control (`DOMAIN-oac`).
-4. CloudFront distribution for `DOMAIN` (HTTPS, HTTP→HTTPS redirect, origin = root bucket via OAC).
-5. Root bucket policy: `cloudfront.amazonaws.com` gets `s3:GetObject` scoped by `AWS:SourceArn` of the root distribution.
-6. CloudFront distribution for `www.DOMAIN` (origin = www bucket's S3 website endpoint).
-7. Route53 A + AAAA alias records (UPSERT) for `DOMAIN` and `www.DOMAIN`.
+1. Route53 **public hosted zone** for `DOMAIN` (created if missing).
+2. **GoDaddy nameserver delegation** → the zone's Route53 nameservers
+   (best-effort: if the domain isn't in your GoDaddy account or no credentials
+   are configured, the nameservers are printed for manual setup and
+   provisioning continues; disable with `--no-godaddy`).
+3. **ACM certificate** in `us-east-1` for `DOMAIN` + `*.DOMAIN`, DNS-validated
+   automatically via Route53 (an existing cert covering `DOMAIN` and
+   `www.DOMAIN` is reused).
+4. `s3://DOMAIN` — private, `BucketOwnerEnforced`, full public-access block.
+5. `s3://www.DOMAIN` — S3 website redirect to `https://DOMAIN`.
+6. CloudFront Origin Access Control (`DOMAIN-oac`).
+7. CloudFront distribution for `DOMAIN` (HTTPS, HTTP→HTTPS redirect, origin = root bucket via OAC).
+8. Root bucket policy: `cloudfront.amazonaws.com` gets `s3:GetObject` scoped by `AWS:SourceArn` of the root distribution.
+9. CloudFront distribution for `www.DOMAIN` (origin = www bucket's S3 website endpoint).
+10. Route53 A + AAAA alias records (UPSERT) for `DOMAIN` and `www.DOMAIN`.
 
 Pre-flight (stops before touching anything on failure):
 
 1. `aws` is installed and your profile has working credentials.
-2. A **public** Route53 hosted zone exists for `DOMAIN`.
-3. An **ISSUED** ACM certificate in `us-east-1` covers both `DOMAIN` and
-   `www.DOMAIN` (wildcard `*.DOMAIN` + apex counts).
-4. Neither bucket name is owned by a different AWS account.
+2. Neither bucket name is owned by a different AWS account.
 
 ```sh
+c godaddy configure                       # once: GoDaddy API key/secret
 c aws --profile work static-site example.com
 ```
 
 Re-running is idempotent: existing resources are detected and left alone.
+If the nameservers were just delegated, ACM validation can take a while; the
+command waits, and if it still times out you can simply re-run it later — the
+pending certificate is reused.
 
 ### `c aws logs …`
 
@@ -87,6 +116,60 @@ c aws logs search myapp-prod-* -q 'stats count() by bin(5m)'
 Under the hood: `describe-log-groups` for discovery, `start-live-tail` for
 `tail`, `start-query` (CloudWatch Logs Insights) for `search`.
 
+### `c aws zone ensure DOMAIN`
+
+Creates a public Route53 hosted zone if missing and prints its nameservers.
+
+### `c aws cert issue DOMAIN`
+
+Requests a DNS-validated ACM cert in `us-east-1` for `DOMAIN` (+ `*.DOMAIN`
+by default, extra SANs via `--san`), writes the validation CNAMEs into the
+Route53 zone, and waits for it to be ISSUED. Reuses a matching existing cert.
+
+## GoDaddy
+
+Requires API credentials: run `c godaddy configure` (saved to
+`~/.config/c/godaddy.json`) or set `GODADDY_API_KEY` / `GODADDY_API_SECRET`.
+Generate Production keys at https://developer.godaddy.com/keys.
+
+### `c godaddy set-ns DOMAIN`
+
+Points a GoDaddy-registered domain's nameservers at its Route53 hosted zone
+(or an explicit list via `-n`). No-op when they already match.
+
+## MCP
+
+`c` ships [Model Context Protocol](https://modelcontextprotocol.io) servers so
+an MCP client (Claude Code / Claude Desktop) can drive the toolbox as tools.
+
+### `c setup`
+
+Registers the `c` MCP servers in the Claude config files — adds an entry to
+each config's `mcpServers` so Claude launches `c mcp <server>` on startup.
+Existing config is preserved and a `.bak` backup is written before any change.
+
+```sh
+c setup                       # claude-code (+ claude-desktop if installed)
+c setup --target project      # write ./.mcp.json instead
+c setup --dry-run             # show what would change, write nothing
+```
+
+Targets: `claude-code` (`~/.claude.json`), `claude-desktop` (the platform
+Desktop config), `project` (`./.mcp.json`). After running, restart Claude.
+
+### `c mcp [SERVER]`
+
+Runs an MCP server over stdio — normally launched by the client, not by hand.
+`c mcp --list` shows the available servers.
+
+**`logs`** — AWS Lambda / CloudWatch Logs. Wraps `c aws logs` so an agent can
+discover a serverless app's Lambda log groups and search/iterate their logs:
+
+- `list_log_groups(pattern)` — discover Lambda log groups matching a glob.
+- `search_logs(pattern, since, until, filter, query, limit)` — CloudWatch Logs
+  Insights search across the matched groups, newest-first. Iterate further back
+  by passing `until` = the oldest `timestamp` from the previous result.
+
 ## Layout
 
 ```
@@ -94,12 +177,23 @@ c/
 ├── pyproject.toml
 └── c/
     ├── cli.py            # `c`
-    └── aws/
-        ├── cli.py        # `c aws`
-        ├── runner.py     # subprocess wrapper around the aws cli
-        ├── check.py      # `c aws check`
-        ├── logs.py       # `c aws logs {list,tail,search}` — glob over log groups, fan-out
-        └── static_site.py# `c aws static-site` (imperative aws cli calls, check-then-create)
+    ├── aws/
+    │   ├── cli.py        # `c aws`
+    │   ├── runner.py     # subprocess wrapper around the aws cli
+    │   ├── check.py      # `c aws check`
+    │   ├── zone.py       # `c aws zone ensure` + ensure_zone() core
+    │   ├── cert.py       # `c aws cert issue` + ensure_certificate() core
+    │   ├── logs.py       # `c aws logs {list,tail,search}` + search_log_groups() core
+    │   └── static_site.py# `c aws static-site` (imperative aws cli calls, check-then-create)
+    ├── godaddy/
+    │   ├── cli.py        # `c godaddy`
+    │   ├── api.py        # stdlib GoDaddy API client (sso-key auth)
+    │   ├── configure.py  # `c godaddy configure` (save key/secret)
+    │   └── set_ns.py     # `c godaddy set-ns` + ensure_godaddy_ns() core
+    └── mcp/
+        ├── cli.py        # `c mcp` (run a server) + `c setup` (register with Claude)
+        ├── __init__.py   # SERVERS registry
+        └── logs_server.py# `logs` MCP server — wraps `c aws logs`
 ```
 
 Adding a new tool group (e.g. `gh`, `docker`): create `c/<group>/cli.py` with a

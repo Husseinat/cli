@@ -17,10 +17,13 @@ def check(ctx: click.Context) -> None:
     aws_path = shutil.which("aws")
     if not aws_path:
         click.secho("✗ aws cli not found on PATH", fg="red", err=True)
-        click.echo(
-            "  Install: https://docs.aws.amazon.com/cli/latest/userguide/getting-started-install.html",
-            err=True,
-        )
+        if sys.platform == "darwin":
+            click.echo("  Install: brew install awscli", err=True)
+        else:
+            click.echo(
+                "  Install: https://docs.aws.amazon.com/cli/latest/userguide/getting-started-install.html",
+                err=True,
+            )
         sys.exit(1)
 
     try:
