@@ -1,4 +1,4 @@
-"""`c aws static-site DOMAIN` — provision a 2x-CloudFront static site.
+"""`c aws static-site DOMAIN` — provision a 2x-CloudFront static site, end to end.
 
 Each resource is created with an explicit `aws` cli call. Every step first
 checks whether the target resource already exists; if so it is left alone and
@@ -6,18 +6,22 @@ the step is skipped. Re-running the command is therefore idempotent: partial
 failures can be resumed just by invoking it again.
 
 Resources (in order):
-    1. S3 bucket for root content (private, served via CloudFront + OAC).
-    2. S3 bucket for www (configured as S3 website redirect to https://root).
-    3. CloudFront Origin Access Control.
-    4. CloudFront distribution for the root alias.
-    5. Root bucket policy (allow CloudFront SourceArn to GetObject).
-    6. CloudFront distribution for the www alias.
-    7. Route53 A + AAAA alias records (UPSERT) for root and www.
+    1. Route53 public hosted zone (created if missing).
+    2. Registrar delegation: GoDaddy nameservers → Route53 (best-effort; if the
+       domain isn't registered with GoDaddy or no credentials are configured,
+       the nameservers are printed for manual setup and provisioning continues).
+    3. ACM certificate in us-east-1 covering DOMAIN + *.DOMAIN, DNS-validated
+       via Route53 (reused if one already covers DOMAIN and www.DOMAIN).
+    4. S3 bucket for root content (private, served via CloudFront + OAC).
+    5. S3 bucket for www (configured as S3 website redirect to https://root).
+    6. CloudFront Origin Access Control.
+    7. CloudFront distribution for the root alias.
+    8. Root bucket policy (allow CloudFront SourceArn to GetObject).
+    9. CloudFront distribution for the www alias.
+   10. Route53 A + AAAA alias records (UPSERT) for root and www.
 
 Pre-flight:
     - aws cli installed + credentials work.
-    - Public Route53 hosted zone exists for DOMAIN.
-    - ISSUED ACM cert in us-east-1 covers DOMAIN and www.DOMAIN.
 """
 from __future__ import annotations
 
@@ -25,12 +29,14 @@ import json
 import os
 import tempfile
 import uuid
-from typing import Any
 
 import click
 
 from c.aws.cert import ensure_certificate
 from c.aws.runner import AwsCliMissing, AwsError, run_aws
+from c.aws.zone import ensure_zone
+from c.godaddy.api import GoDaddyError
+from c.godaddy.set_ns import ensure_godaddy_ns
 
 # ─── Constants ───────────────────────────────────────────────────────────────
 CERT_REGION = "us-east-1"
@@ -65,7 +71,7 @@ def _fail(msg: str) -> click.ClickException:
     return click.ClickException(msg)
 
 
-# ─── Pre-flight: hosted zone / cert lookup ───────────────────────────────────
+# ─── DNS: hosted zone + registrar delegation ─────────────────────────────────
 def _cert_covers(pattern: str, host: str) -> bool:
     pattern = pattern.lower().rstrip(".")
     host = host.lower().rstrip(".")
@@ -78,19 +84,29 @@ def _cert_covers(pattern: str, host: str) -> bool:
     return False
 
 
-def _find_hosted_zone(domain: str, profile: str | None) -> str:
-    data = run_aws(
-        ["route53", "list-hosted-zones-by-name", "--dns-name", domain],
-        profile=profile, parse_json=True,
-    )
-    target = domain.rstrip(".") + "."
-    for zone in data.get("HostedZones", []):
-        if zone["Name"] == target and not zone.get("Config", {}).get("PrivateZone", False):
-            return zone["Id"].split("/")[-1]
-    raise _fail(
-        f"No public Route53 hosted zone found for '{domain}'. "
-        f"Create one, delegate your registrar's nameservers, then retry."
-    )
+def _ensure_delegation(domain: str, nameservers: list[str], *, godaddy: bool) -> None:
+    """Best-effort: point the GoDaddy-registered domain at the Route53 nameservers.
+
+    Failures (no credentials, domain not in the GoDaddy account, API errors)
+    don't stop provisioning — the nameservers are printed for manual setup.
+    """
+    if not godaddy:
+        _skip("GoDaddy delegation disabled (--no-godaddy); make sure your registrar points at:")
+        for n in nameservers:
+            click.echo(f"      {n}")
+        return
+    try:
+        updated = ensure_godaddy_ns(domain, nameservers)
+    except GoDaddyError as e:
+        _skip(f"could not update GoDaddy nameservers: {e}")
+        click.echo("    Point your registrar at these nameservers manually:")
+        for n in nameservers:
+            click.echo(f"      {n}")
+        return
+    if updated:
+        _ok("GoDaddy nameservers now point at Route53 (propagation can take a while)")
+    else:
+        _skip("GoDaddy nameservers already point at Route53")
 
 
 def _find_issued_certificate(domain: str, profile: str | None) -> str | None:
@@ -461,9 +477,16 @@ def _wait_deployed(dist_id: str, profile: str | None, label: str) -> None:
     "--wait/--no-wait", default=True,
     help="Wait for CloudFront distributions to reach Deployed state.",
 )
+@click.option(
+    "--godaddy/--no-godaddy", "godaddy", default=True,
+    help="Point the domain's GoDaddy nameservers at the Route53 zone (best-effort).",
+)
 @click.pass_context
-def static_site(ctx: click.Context, domain: str, region: str | None, wait: bool) -> None:
-    """Provision a static site: S3 + CloudFront (root + www redirect) + Route53."""
+def static_site(
+    ctx: click.Context, domain: str, region: str | None, wait: bool, godaddy: bool
+) -> None:
+    """Provision a static site end to end: Route53 zone + GoDaddy delegation +
+    ACM cert + S3 + CloudFront (root + www redirect) + alias records."""
     domain = domain.strip().lower().rstrip(".")
     profile = ctx.obj.get("profile")
     region = region or ctx.obj.get("region") or "us-east-1"
@@ -483,9 +506,16 @@ def static_site(ctx: click.Context, domain: str, region: str | None, wait: bool)
         raise _fail(f"Credentials not working: {e}")
     _ok(f"account {ident['Account']} ({ident['Arn']})")
 
-    _step(f"Finding Route53 hosted zone for {domain}")
-    zone_id = _find_hosted_zone(domain, profile)
-    _ok(f"hosted zone {zone_id}")
+    # ── DNS ──
+    _step(f"Route53 hosted zone for {domain}")
+    zone_id, nameservers, created = ensure_zone(domain, profile)
+    if created:
+        _ok(f"created hosted zone {zone_id}")
+    else:
+        _skip(f"hosted zone {zone_id} already exists")
+
+    _step("Registrar delegation (GoDaddy → Route53)")
+    _ensure_delegation(domain, nameservers, godaddy=godaddy)
 
     _step(f"Finding ACM cert covering {domain} and www.{domain} in {CERT_REGION}")
     cert_arn = _find_issued_certificate(domain, profile)

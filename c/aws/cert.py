@@ -174,14 +174,35 @@ def ensure_certificate(
     _ok(f"upserted {n} record(s) into zone {zone_id}")
 
     if wait:
-        _step("Waiting for ACM to validate and issue (typically 1–5 min)")
-        try:
-            run_aws(
-                ["acm", "wait", "certificate-validated", "--certificate-arn", cert_arn],
-                profile=profile, region=CERT_REGION, capture=False,
-            )
-        except AwsError as e:
-            raise click.ClickException(f"ACM validation did not complete: {e}")
+        _step(
+            "Waiting for ACM to validate and issue "
+            "(typically 1–5 min; longer if nameserver delegation is still propagating)"
+        )
+        # The acm waiter gives up after ~40 min. A zone delegated moments ago can
+        # take longer than that to propagate, so check the status and try again
+        # once before giving up.
+        for attempt in (1, 2):
+            try:
+                run_aws(
+                    ["acm", "wait", "certificate-validated", "--certificate-arn", cert_arn],
+                    profile=profile, region=CERT_REGION, capture=False,
+                )
+                break
+            except AwsError as e:
+                status = run_aws(
+                    ["acm", "describe-certificate", "--certificate-arn", cert_arn],
+                    profile=profile, region=CERT_REGION, parse_json=True,
+                )["Certificate"]["Status"]
+                if status == "ISSUED":
+                    break
+                if status == "PENDING_VALIDATION" and attempt == 1:
+                    _skip("still PENDING_VALIDATION — nameserver propagation can be slow; waiting more")
+                    continue
+                raise click.ClickException(
+                    f"Certificate is {status} after waiting ({e}). If the nameservers were "
+                    f"just changed at the registrar, propagation can take a few hours — "
+                    f"re-run later; the pending certificate will be reused."
+                )
         _ok("certificate ISSUED")
 
     return cert_arn

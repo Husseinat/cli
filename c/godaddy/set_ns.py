@@ -30,6 +30,21 @@ def _route53_nameservers(domain: str, profile: str | None) -> list[str]:
     return data["DelegationSet"]["NameServers"]
 
 
+def ensure_godaddy_ns(domain: str, nameservers: list[str]) -> bool:
+    """Point the GoDaddy-registered `domain` at `nameservers`.
+
+    Returns True when an update was made, False when GoDaddy already matches.
+    Raises GoDaddyError (missing credentials, domain not in account, API error).
+    """
+    current = gd_request("GET", f"/v1/domains/{domain}")
+    current_ns = sorted((n or "").lower().rstrip(".") for n in (current.get("nameServers") or []))
+    target_ns = sorted(n.lower().rstrip(".") for n in nameservers)
+    if current_ns == target_ns:
+        return False
+    gd_request("PATCH", f"/v1/domains/{domain}", {"nameServers": nameservers})
+    return True
+
+
 @click.command("set-ns")
 @click.argument("domain")
 @click.option(
@@ -48,26 +63,18 @@ def set_ns(ctx: click.Context, domain: str, nameservers: tuple[str, ...]) -> Non
             f"Got only {len(ns)} nameserver(s); need at least 2. (Route53 delegation sets always return 4.)"
         )
 
-    # Current state — GET is idempotent and lets us short-circuit.
     try:
-        current = gd_request("GET", f"/v1/domains/{domain}")
+        updated = ensure_godaddy_ns(domain, ns)
     except GoDaddyError as e:
         raise click.ClickException(str(e))
 
-    current_ns = sorted((n or "").lower().rstrip(".") for n in (current.get("nameServers") or []))
-    target_ns = sorted(n.lower() for n in ns)
-    if current_ns == target_ns:
+    if not updated:
         click.secho(f"  ↷ GoDaddy NS for {domain} already match:", fg="yellow")
         for n in ns:
             click.echo(f"    {n}")
         return
 
-    click.secho(f"→ Updating GoDaddy NS for {domain}:", fg="cyan")
+    click.secho(f"→ Updated GoDaddy NS for {domain}:", fg="cyan")
     for n in ns:
         click.echo(f"    {n}")
-
-    try:
-        gd_request("PATCH", f"/v1/domains/{domain}", {"nameServers": ns})
-    except GoDaddyError as e:
-        raise click.ClickException(str(e))
     click.secho("  ✓ updated (propagation can take a few hours)", fg="green")
