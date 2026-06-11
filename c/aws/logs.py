@@ -95,6 +95,109 @@ def _arn(group: dict[str, Any]) -> str:
     return (group.get("arn") or "").rstrip(":*")
 
 
+# ─── Reusable core ───────────────────────────────────────────────────────────
+def search_log_groups(
+    pattern: str,
+    *,
+    since: str = "1h",
+    until: str | None = None,
+    filter_expr: str | None = None,
+    query: str | None = None,
+    limit: int = 100,
+    profile: str | None = None,
+    region: str | None = None,
+) -> dict[str, Any]:
+    """Run a CloudWatch Logs Insights query across every group matching PATTERN.
+
+    Shared by `c aws logs search` and the `logs` MCP server. Returns a dict with
+    ``groups``, ``rows`` (newest-first), ``stats`` and the resolved time window.
+    Raises ``ValueError`` on bad input or a query that fails / times out.
+    """
+    groups = _discover_groups(pattern, profile, region)
+    if not groups:
+        raise ValueError(f"no log groups match {pattern!r}")
+    if len(groups) > INSIGHTS_MAX_GROUPS:
+        raise ValueError(
+            f"{len(groups)} groups match; Logs Insights accepts at most "
+            f"{INSIGHTS_MAX_GROUPS}. Refine the pattern."
+        )
+
+    start_dt = _parse_time(since)
+    end_dt = _parse_time(until) if until else datetime.now(tz=timezone.utc)
+
+    if query:
+        q = query
+    else:
+        parts = ["fields @timestamp, @log, @message"]
+        if filter_expr:
+            escaped = filter_expr.replace("\\", "\\\\").replace('"', '\\"')
+            parts.append(f'| filter @message like "{escaped}"')
+        parts += ["| sort @timestamp desc", f"| limit {limit}"]
+        q = " ".join(parts)
+
+    arns = [_arn(g) for g in groups]
+    start = run_aws(
+        [
+            "logs", "start-query",
+            "--start-time", str(int(start_dt.timestamp())),
+            "--end-time", str(int(end_dt.timestamp())),
+            "--log-group-identifiers", *arns,
+            "--query-string", q,
+        ],
+        profile=profile,
+        region=region,
+        parse_json=True,
+    )
+    query_id = start["queryId"]
+
+    status = "Running"
+    result: dict[str, Any] = {}
+    deadline = time.time() + 60
+    while status in ("Running", "Scheduled"):
+        if time.time() > deadline:
+            raise ValueError(f"query {query_id} timed out after 60s")
+        time.sleep(0.5)
+        result = run_aws(
+            ["logs", "get-query-results", "--query-id", query_id],
+            profile=profile,
+            region=region,
+            parse_json=True,
+        )
+        status = result.get("status", "Unknown")
+
+    if status != "Complete":
+        raise ValueError(f"query {status.lower()}")
+
+    rows: list[dict[str, str]] = []
+    for raw in result.get("results", []):
+        row = {c["field"]: c["value"] for c in raw}
+        # `@log` is "<account>:<logGroupName>"; strip to the log-group name.
+        log = row.get("@log", "")
+        name = log.split(":", 1)[1] if ":" in log else log
+        rows.append(
+            {
+                "timestamp": row.get("@timestamp", ""),
+                "log_group": name,
+                "function": _short(name),
+                "message": (row.get("@message") or "").rstrip(),
+            }
+        )
+
+    stats = result.get("statistics", {}) or {}
+    return {
+        "groups": [g["logGroupName"] for g in groups],
+        "query_id": query_id,
+        "query": q,
+        "start": start_dt.isoformat(),
+        "end": end_dt.isoformat(),
+        "rows": rows,
+        "stats": {
+            "records_scanned": int(stats.get("recordsScanned", 0)),
+            "bytes_scanned": int(stats.get("bytesScanned", 0)),
+        },
+    }
+
+
 # ─── Command group ───────────────────────────────────────────────────────────
 @click.group("logs", context_settings={"help_option_names": ["-h", "--help"]})
 def logs() -> None:
@@ -293,99 +396,48 @@ def search_cmd(
     profile = ctx.obj.get("profile")
     region = ctx.obj.get("region")
 
-    groups = _discover_groups(pattern, profile, region)
-    if not groups:
-        click.secho(f"✗ no log groups match {pattern!r}", fg="red", err=True)
-        sys.exit(1)
-    if len(groups) > INSIGHTS_MAX_GROUPS:
-        click.secho(
-            f"✗ {len(groups)} groups match; Logs Insights accepts at most "
-            f"{INSIGHTS_MAX_GROUPS}. Refine the pattern.",
-            fg="red",
-            err=True,
+    try:
+        res = search_log_groups(
+            pattern,
+            since=since,
+            until=until,
+            filter_expr=filter_expr,
+            query=query,
+            limit=limit,
+            profile=profile,
+            region=region,
         )
+    except ValueError as e:
+        click.secho(f"✗ {e}", fg="red", err=True)
         sys.exit(1)
 
-    start_dt = _parse_time(since)
-    end_dt = _parse_time(until) if until else datetime.now(tz=timezone.utc)
-
-    if query:
-        q = query
-    else:
-        parts = ["fields @timestamp, @log, @message"]
-        if filter_expr:
-            escaped = filter_expr.replace("\\", "\\\\").replace('"', '\\"')
-            parts.append(f'| filter @message like "{escaped}"')
-        parts += ["| sort @timestamp desc", f"| limit {limit}"]
-        q = " ".join(parts)
-
-    arns = [_arn(g) for g in groups]
-    start = run_aws(
-        [
-            "logs",
-            "start-query",
-            "--start-time",
-            str(int(start_dt.timestamp())),
-            "--end-time",
-            str(int(end_dt.timestamp())),
-            "--log-group-identifiers",
-            *arns,
-            "--query-string",
-            q,
-        ],
-        profile=profile,
-        region=region,
-        parse_json=True,
-    )
-    query_id = start["queryId"]
-
+    start_dt = datetime.fromisoformat(res["start"])
+    end_dt = datetime.fromisoformat(res["end"])
     click.secho(
-        f"  ▶ insights query {query_id} — {len(groups)} group(s), "
+        f"  ▶ insights query {res['query_id']} — {len(res['groups'])} group(s), "
         f"{start_dt.astimezone():%Y-%m-%d %H:%M} → "
         f"{end_dt.astimezone():%Y-%m-%d %H:%M}",
         fg="cyan",
     )
 
-    status = "Running"
-    result: dict[str, Any] = {}
-    while status in ("Running", "Scheduled"):
-        time.sleep(0.5)
-        result = run_aws(
-            ["logs", "get-query-results", "--query-id", query_id],
-            profile=profile,
-            region=region,
-            parse_json=True,
-        )
-        status = result.get("status", "Unknown")
-
-    if status != "Complete":
-        click.secho(f"✗ query {status.lower()}", fg="red", err=True)
-        sys.exit(1)
-
-    rows = [{c["field"]: c["value"] for c in row} for row in result.get("results", [])]
+    rows = res["rows"]
     if not rows:
         click.secho("  (no matches)", fg="yellow")
         return
 
-    # `@log` is "<account>:<logGroupName>" — strip to just the function name.
-    def _label(row: dict[str, str]) -> str:
-        log = row.get("@log", "")
-        name = log.split(":", 1)[1] if ":" in log else log
-        return _short(name)
-
-    width = min(40, max(len(_label(r)) for r in rows))
+    width = min(40, max(len(r["function"]) for r in rows))
     for row in rows:
-        ts = row.get("@timestamp", "")
-        msg = (row.get("@message") or "").rstrip()
         click.echo(
-            f"  {ts}  {click.style(_label(row).ljust(width)[:width], fg='cyan')}  {msg}"
+            f"  {row['timestamp']}  "
+            f"{click.style(row['function'].ljust(width)[:width], fg='cyan')}  "
+            f"{row['message']}"
         )
 
-    stats = result.get("statistics", {}) or {}
+    stats = res["stats"]
     click.echo()
     click.secho(
         f"  {len(rows)} record(s) — scanned "
-        f"{int(stats.get('recordsScanned', 0)):,} records "
-        f"({_human_size(int(stats.get('bytesScanned', 0)))})",
+        f"{stats['records_scanned']:,} records "
+        f"({_human_size(stats['bytes_scanned'])})",
         fg="cyan",
     )

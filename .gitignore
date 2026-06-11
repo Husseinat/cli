@@ -37,5 +37,7 @@ htmlcov/
 .env
 .env.*
 
-# Machine-local Claude Code state
+# Machine-local Claude Code state (absolute paths from `c setup`)
 .claude/
+.mcp.json
+*.bak
